@@ -166,5 +166,7 @@ def main(config: dict):
  
 
 if __name__ == "__main__":
+    print(f'miner starting')
     config = get_config()
+    print(f'config: {config}')
     main(config)
