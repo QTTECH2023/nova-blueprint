@@ -36,6 +36,7 @@ def get_available_reactions(db_path: str = None) -> List[Tuple[int, str, int, in
     if db_path is None:
         db_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "combinatorial_db", "molecules.sqlite"))
 
+    # QTTECH begin
     if os.path.exists(db_path):
         print(f"数据库文件存在: {db_path}")
         if os.access(db_path, os.R_OK):
@@ -44,6 +45,7 @@ def get_available_reactions(db_path: str = None) -> List[Tuple[int, str, int, in
             print("数据库文件不可读")
     else:
         print(f"数据库文件不存在: {db_path}")
+    # QTTECH begin
 
     try:
         conn = sqlite3.connect(db_path)
@@ -232,29 +234,35 @@ def run_sampler(n_samples: int = 1000,
                 output_path: str = None, 
                 save_to_file: bool = False,
                 db_path: str = None):
-    reactions = get_available_reactions(db_path)
-    if not reactions:
-        bt.logging.error("No reactions found in the database, check db path and integrity.")
-        return
-
-    rxn_ids = [reactions[i][0] for i in range(len(reactions))]
+    # QTTECH begin
+    # reactions = get_available_reactions(db_path)
+    # if not reactions:
+    #     bt.logging.error("No reactions found in the database, check db path and integrity.")
+    #     return
+    #
+    # rxn_ids = [reactions[i][0] for i in range(len(reactions))]
+    # QTTECH end
 
     rxn_id = int(subnet_config["allowed_reaction"].split(":")[-1])
     bt.logging.info(f"Generating {n_samples} random molecules for reaction {rxn_id}")
     print(f"Generating {n_samples} random molecules for reaction {rxn_id}")
 
+    # QTTECH begin
     if rxn_id == 0:
         gen_type = 'savi'
     else:
         gen_type = f"rxn:{rxn_id}"
 
     molecules: List = FIXED_MOLECULES[gen_type]
-    return {"molecules": molecules}
+    sampler_data = {"molecules": molecules}
+    # QTTECH end
 
+    # QTTECH begin
     # Generate molecules with validation in batches for efficiency
-    sampler_data = generate_valid_random_molecules_batch(
-        rxn_id, n_samples, db_path, subnet_config, batch_size=200, seed=seed
-        )
+    # sampler_data = generate_valid_random_molecules_batch(
+    #     rxn_id, n_samples, db_path, subnet_config, batch_size=200, seed=seed
+    #     )
+    # QTTECH end
 
     if save_to_file:
         with open(output_path, "w") as f:

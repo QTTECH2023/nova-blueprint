@@ -24,6 +24,7 @@ from nova_ph2.combinatorial_db.reactions import get_smiles_from_reaction
 # DB_PATH = str(Path(BASE_DIR).resolve().parent / "nova_ph2" / "combinatorial_db" / "molecules.sqlite")
 # DB_PATH = "/usr/local/lib/python3.12/site-packages/nova_ph2/combinatorial_db/molecules.sqlite"
 DB_PATH = str(Path(__file__).parent / "combinatorial_db" / "molecules.sqlite")
+OUTPUT_DIR = os.getenv('OUTPUT_DIR', str(BASE_DIR)) # QTTECH add
 
 
 def get_config(input_file: os.path = os.path.join(BASE_DIR, "input.json")):
@@ -147,14 +148,14 @@ def calculate_final_scores(score_dict: dict,
 
     if save_all_scores:
         all_scores = {"scored_molecules": [(mol["name"], mol["score"]) for mol in batch_scores.to_dict(orient="records")]}
-        
-        if os.path.exists(os.path.join(BASE_DIR, f"all_scores_{current_epoch}.json")):
-            with open(os.path.join(BASE_DIR, f"all_scores_{current_epoch}.json"), "r") as f:
+
+        if os.path.exists(os.path.join(OUTPUT_DIR, f"all_scores_{current_epoch}.json")): # QTTECH modify
+            with open(os.path.join(OUTPUT_DIR, f"all_scores_{current_epoch}.json"), "r") as f: # QTTECH modify
                 all_previous_scores = json.load(f)
             
             all_scores["scored_molecules"] = all_previous_scores["scored_molecules"] + all_scores["scored_molecules"]
 
-        with open(os.path.join(BASE_DIR, f"all_scores_{current_epoch}.json"), "w") as f:
+        with open(os.path.join(OUTPUT_DIR, f"all_scores_{current_epoch}.json"), "w") as f: # QTTECH modify
             json.dump(all_scores, f, ensure_ascii=False, indent=2)
 
     return batch_scores
@@ -162,8 +163,8 @@ def calculate_final_scores(score_dict: dict,
 def main(config: dict):
     iterative_sampling_loop(
         db_path=DB_PATH,
-        sampler_file_path=os.path.join(BASE_DIR, "sampler_file.json"),
-        output_path=os.path.join(BASE_DIR, 'out', "result.json"), # QTTECH modify
+        sampler_file_path=os.path.join(OUTPUT_DIR, "sampler_file.json"), # QTTECH modify
+        output_path=os.path.join(OUTPUT_DIR, "result.json"), # QTTECH modify
         config=config,
         save_all_scores=True,
     )
