@@ -10,22 +10,20 @@ import bittensor as bt
 import pandas as pd
 from rdkit import Chem
 from pathlib import Path
+import nova_ph2
 
 BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__)))
-PARENT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+PARENT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 sys.path.append(PARENT_DIR)
+
+OUTPUT_DIR = os.environ.get("OUTPUT_DIR", "/output")
 
 from nova_ph2.neurons.validator.scoring import score_molecules_json
 import nova_ph2.neurons.validator.scoring as scoring_module
 from random_sampler import run_sampler
 from nova_ph2.combinatorial_db.reactions import get_smiles_from_reaction
 
-#DB_PATH = str(Path(nova_ph2.__file__).resolve().parent / "combinatorial_db" / "molecules.sqlite")
-# DB_PATH = str(Path(BASE_DIR).resolve().parent / "nova_ph2" / "combinatorial_db" / "molecules.sqlite")
-# DB_PATH = "/usr/local/lib/python3.12/site-packages/nova_ph2/combinatorial_db/molecules.sqlite"
-DB_PATH = str(Path(__file__).parent / "combinatorial_db" / "molecules.sqlite")
-OUTPUT_DIR = os.getenv('OUTPUT_DIR', str(BASE_DIR)) # QTTECH add
-
+DB_PATH = str(Path(nova_ph2.__file__).resolve().parent / "combinatorial_db" / "molecules.sqlite")
 
 def get_config(input_file: os.path = os.path.join(BASE_DIR, "input.json")):
     """
@@ -50,13 +48,16 @@ def iterative_sampling_loop(
       3) Merge with previous top x, deduplicate, sort, select top x
       4) Write top x to file (overwrite) each iteration
     """
-    n_samples = config["num_molecules"] * 1 # QTTECH modify
+    n_samples = config["num_molecules"] * 5
 
     top_pool = pd.DataFrame(columns=["name", "smiles", "InChIKey", "score"])
+    seen_inchikeys = set()
 
     iteration = 0
-    # while True:
-    while iteration < 1: # QTTECH modify
+    mutation_prob = 0.1
+    elite_frac = 0.5
+
+    while True:
         iteration += 1
         bt.logging.info(f"[Miner] Iteration {iteration}: sampling {n_samples} molecules")
 
@@ -65,11 +66,54 @@ def iterative_sampling_loop(
                         output_path=sampler_file_path,
                         save_to_file=True,
                         db_path=db_path,
+                        elite_names=top_pool["name"].tolist() if not top_pool.empty else None,
+                        elite_frac=elite_frac,
+                        mutation_prob=mutation_prob,
+                        avoid_inchikeys=seen_inchikeys,
                         )
         
         if not sampler_data:
             bt.logging.warning("[Miner] No valid molecules produced; continuing")
             continue
+
+        try:
+            names = sampler_data["molecules"]
+            filtered_names = []
+            for name in names:
+                try:
+                    s = get_smiles_from_reaction(name)
+                    if not s:
+                        continue
+                    mol = Chem.MolFromSmiles(s)
+                    if not mol:
+                        continue
+                    key = Chem.MolToInchiKey(mol)
+                    if key in seen_inchikeys:
+                        continue
+                    filtered_names.append(name)
+                except Exception:
+                    continue
+
+            if not filtered_names:
+                bt.logging.warning("All sampled molecules were previously seen; continuing")
+                continue
+
+            if len(filtered_names) < len(names):
+                bt.logging.warning(f"{len(names) - len(filtered_names)} molecules were previously seen; continuing with unseen only")
+
+            dup_ratio = (len(names) - len(filtered_names)) / max(1, len(names))
+            if dup_ratio > 0.6:
+                mutation_prob = min(0.5, mutation_prob * 1.5)
+                elite_frac = max(0.2, elite_frac * 0.8)
+            elif dup_ratio < 0.2 and not top_pool.empty:
+                mutation_prob = max(0.05, mutation_prob * 0.9)
+                elite_frac = min(0.8, elite_frac * 1.1)
+
+            sampler_data = {"molecules": filtered_names}
+            with open(sampler_file_path, "w") as f:
+                json.dump(sampler_data, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            bt.logging.warning(f"[Miner] Pre-score deduplication failed; proceeding unfiltered: {e}")
 
         score_dict = score_molecules_json(sampler_file_path, 
                                          config["target_sequences"], 
@@ -82,6 +126,11 @@ def iterative_sampling_loop(
 
         # Calculate final scores per molecule
         batch_scores = calculate_final_scores(score_dict, sampler_data, config, save_all_scores)
+
+        try:
+            seen_inchikeys.update([k for k in batch_scores["InChIKey"].tolist() if k])
+        except Exception:
+            pass
 
         # Merge, deduplicate, sort and take top x
         top_pool = pd.concat([top_pool, batch_scores])
@@ -148,14 +197,12 @@ def calculate_final_scores(score_dict: dict,
 
     if save_all_scores:
         all_scores = {"scored_molecules": [(mol["name"], mol["score"]) for mol in batch_scores.to_dict(orient="records")]}
-
-        if os.path.exists(os.path.join(OUTPUT_DIR, f"all_scores_{current_epoch}.json")): # QTTECH modify
-            with open(os.path.join(OUTPUT_DIR, f"all_scores_{current_epoch}.json"), "r") as f: # QTTECH modify
+        all_scores_path = os.path.join(OUTPUT_DIR, f"all_scores_{current_epoch}.json")
+        if os.path.exists(all_scores_path):
+            with open(all_scores_path, "r") as f:
                 all_previous_scores = json.load(f)
-            
             all_scores["scored_molecules"] = all_previous_scores["scored_molecules"] + all_scores["scored_molecules"]
-
-        with open(os.path.join(OUTPUT_DIR, f"all_scores_{current_epoch}.json"), "w") as f: # QTTECH modify
+        with open(all_scores_path, "w") as f:
             json.dump(all_scores, f, ensure_ascii=False, indent=2)
 
     return batch_scores
@@ -163,15 +210,13 @@ def calculate_final_scores(score_dict: dict,
 def main(config: dict):
     iterative_sampling_loop(
         db_path=DB_PATH,
-        sampler_file_path=os.path.join(OUTPUT_DIR, "sampler_file.json"), # QTTECH modify
-        output_path=os.path.join(OUTPUT_DIR, "result.json"), # QTTECH modify
+        sampler_file_path=os.path.join(OUTPUT_DIR, "sampler_file.json"),
+        output_path=os.path.join(OUTPUT_DIR, "result.json"),
         config=config,
         save_all_scores=True,
     )
  
 
 if __name__ == "__main__":
-    bt.logging.enable_debug()
-
     config = get_config()
     main(config)

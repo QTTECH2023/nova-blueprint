@@ -6,12 +6,13 @@ from typing import List, Tuple, Optional
 import bittensor as bt
 from rdkit import Chem
 from tqdm import tqdm
+import re
+from collections import defaultdict
 
 import sys
 
-from mols import FIXED_MOLECULES
-
 BASE_DIR = os.path.abspath(os.path.dirname(__file__))
+OUTPUT_DIR = os.environ.get("OUTPUT_DIR", "/output")
 
 from miner_utils import validate_molecules_sampler
 from nova_ph2.combinatorial_db.reactions import (
@@ -30,25 +31,13 @@ def get_available_reactions(db_path: str = None) -> List[Tuple[int, str, int, in
     Returns:
         List of tuples (rxn_id, smarts, roleA, roleB, roleC)
     """
-    bt.logging.info(f"Getting available reactions, path: {db_path}")
-    print(f"Getting available reactions here, path: {db_path}")
-
     if db_path is None:
         db_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "combinatorial_db", "molecules.sqlite"))
-
-    # QTTECH begin
-    if os.path.exists(db_path):
-        print(f"数据库文件存在: {db_path}")
-        if os.access(db_path, os.R_OK):
-            print("数据库文件可读")
-        else:
-            print("数据库文件不可读")
-    else:
-        print(f"数据库文件不存在: {db_path}")
-    # QTTECH begin
-
+    
     try:
-        conn = sqlite3.connect(db_path)
+        abs_db_path = os.path.abspath(db_path)
+        conn = sqlite3.connect(f"file:{abs_db_path}?mode=ro&immutable=1", uri=True)
+        conn.execute("PRAGMA query_only = ON")
         cursor = conn.cursor()
         cursor.execute("SELECT rxn_id, smarts, roleA, roleB, roleC FROM reactions")
         results = cursor.fetchall()
@@ -71,7 +60,8 @@ def get_molecules_by_role(role_mask: int, db_path: str) -> List[Tuple[int, str, 
         List of tuples (mol_id, smiles, role_mask) for molecules that match the role
     """
     try:
-        conn = sqlite3.connect(db_path)
+        abs_db_path = os.path.abspath(db_path)
+        conn = sqlite3.connect(f"file:{abs_db_path}?mode=ro&immutable=1", uri=True)
         cursor = conn.cursor()
         cursor.execute(
             "SELECT mol_id, smiles, role_mask FROM molecules WHERE (role_mask & ?) = ?", 
@@ -84,24 +74,13 @@ def get_molecules_by_role(role_mask: int, db_path: str) -> List[Tuple[int, str, 
         bt.logging.error(f"Error getting molecules by role {role_mask}: {e}")
         return []
 
-
-
 def generate_valid_random_molecules_batch(rxn_id: int, n_samples: int, db_path: str, subnet_config: dict, 
-                                 batch_size: int = 200, seed: int = None) -> dict:
+                                 batch_size: int = 200, seed: int = None,
+                                 elite_names: list[str] = None, elite_frac: float = 0.5, mutation_prob: float = 0.1,
+                                 avoid_inchikeys: set[str] = None) -> dict:
     """
     Efficiently generate n_samples valid molecules by generating them in batches and validating.
-    
-    Args:
-        rxn_id: The reaction ID to use
-        n_samples: Number of valid molecules to generate
-        db_path: Path to the molecules database
-        subnet_config: Configuration for validation
-        batch_size: Number of molecules to generate per batch
-        
-    Returns:
-        Dict of molecules for the sampler uid=0
     """
-    # Pre-fetch molecule pools to avoid repeated database queries
     reaction_info = get_reaction_info(rxn_id, db_path)
     if not reaction_info:
         bt.logging.error(f"Could not get reaction info for rxn_id {rxn_id}")
@@ -110,7 +89,6 @@ def generate_valid_random_molecules_batch(rxn_id: int, n_samples: int, db_path: 
     smarts, roleA, roleB, roleC = reaction_info
     is_three_component = roleC is not None and roleC != 0
     
-    # Cache molecule pools to avoid repeated database queries
     molecules_A = get_molecules_by_role(roleA, db_path)
     molecules_B = get_molecules_by_role(roleB, db_path)
     molecules_C = get_molecules_by_role(roleC, db_path) if is_three_component else []
@@ -118,7 +96,7 @@ def generate_valid_random_molecules_batch(rxn_id: int, n_samples: int, db_path: 
     if not molecules_A or not molecules_B or (is_three_component and not molecules_C):
         bt.logging.error(f"No molecules found for roles A={roleA}, B={roleB}, C={roleC}")
         return {"molecules": [None] * n_samples}
-    
+
     valid_molecules = []
     seen_keys = set()
     iteration = 0
@@ -128,31 +106,50 @@ def generate_valid_random_molecules_batch(rxn_id: int, n_samples: int, db_path: 
     while len(valid_molecules) < n_samples:
         iteration += 1
         
-        # Calculate how many molecules we still need
         needed = n_samples - len(valid_molecules)
         
-        # Generate a batch of molecules (with some buffer for validation failures)
-        batch_size_actual = min(batch_size, needed * 2)  # Generate 2x what we need to account for failures
+        batch_size_actual = min(batch_size, needed * 2)
         
-        #bt.logging.debug(f"Iteration {iteration}: Generating {batch_size_actual} molecules, need {needed} more")
+        emitted_names = set()
+        if elite_names:
+            n_elite = max(0, min(batch_size_actual, int(batch_size_actual * elite_frac)))
+            n_rand = batch_size_actual - n_elite
+
+            elite_batch = generate_offspring_from_elites(
+                rxn_id=rxn_id,
+                n=n_elite,
+                elite_names=elite_names,
+                molecules_A=molecules_A,
+                molecules_B=molecules_B,
+                molecules_C=molecules_C,
+                is_three_component=is_three_component,
+                mutation_prob=mutation_prob,
+                seed=seed,
+                avoid_names=emitted_names,
+                avoid_inchikeys=avoid_inchikeys,
+                max_tries=10
+            )
+            emitted_names.update(elite_batch)
+
+            rand_batch = generate_molecules_from_pools(
+                rxn_id, n_rand, molecules_A, molecules_B, molecules_C, is_three_component, seed
+            )
+            rand_batch = [n for n in rand_batch if n and (n not in emitted_names)]
+            batch_molecules = elite_batch + rand_batch
+        else:
+            batch_molecules = generate_molecules_from_pools(
+                rxn_id, batch_size_actual, molecules_A, molecules_B, molecules_C, is_three_component, seed
+            )
         
-        # Generate batch molecules efficiently
-        batch_molecules = generate_molecules_from_pools(
-            rxn_id, batch_size_actual, molecules_A, molecules_B, molecules_C, is_three_component, seed
-        )
-        
-        # Validate the batch
         batch_sampler_data = {"molecules": batch_molecules}
         batch_valid_molecules, batch_valid_smiles = validate_molecules_sampler(batch_sampler_data, subnet_config)
 
-        # Deduplicate inside the batch (keep first per InChIKey)
         identical = find_chemically_identical(batch_valid_smiles)
         skip_indices = set()
         for indices in identical.values():
             for j in indices[1:]:
                 skip_indices.add(j)
 
-        # Add only chemically-unique molecules across all batches
         added = 0
         for i, name in enumerate(batch_valid_molecules):
             if i in skip_indices or not name:
@@ -175,9 +172,7 @@ def generate_valid_random_molecules_batch(rxn_id: int, n_samples: int, db_path: 
             added += 1
         
         progress_bar.update(added)
-        #bt.logging.debug(f"Batch validation: {len(batch_valid_molecules)}/{len(batch_molecules)} molecules passed")
     
-    # Trim to exact number requested
     final_molecules = valid_molecules[:n_samples]
     progress_bar.close()
 
@@ -186,18 +181,6 @@ def generate_valid_random_molecules_batch(rxn_id: int, n_samples: int, db_path: 
 
 def generate_molecules_from_pools(rxn_id: int, n: int, molecules_A: List[Tuple], molecules_B: List[Tuple], 
                                 molecules_C: List[Tuple], is_three_component: bool, seed: int = None) -> List[str]:
-    """
-    Generate molecules using pre-fetched molecule pools to avoid database queries.
-    
-    Args:
-        rxn_id: The reaction ID
-        n: Number of molecules to generate
-        molecules_A, molecules_B, molecules_C: Pre-fetched molecule pools
-        is_three_component: Whether this is a 3-component reaction
-        seed: Random seed for reproducibility (optional)
-    Returns:
-        List of molecule names
-    """
     mol_ids = []
 
     if seed is not None:
@@ -205,7 +188,6 @@ def generate_molecules_from_pools(rxn_id: int, n: int, molecules_A: List[Tuple],
     
     for i in range(n):
         try:
-            # Randomly select molecules for each role
             mol_A = random.choice(molecules_A)
             mol_B = random.choice(molecules_B)
             
@@ -227,42 +209,108 @@ def generate_molecules_from_pools(rxn_id: int, n: int, molecules_A: List[Tuple],
     
     return mol_ids
 
+def _parse_components(name: str) -> tuple[int, int, int | None]:
+    # name format: "rxn:{rxn_id}:{A}:{B}" or "rxn:{rxn_id}:{A}:{B}:{C}"
+    parts = name.split(":")
+    if len(parts) < 4:
+        return None, None, None
+    A = int(parts[2]); B = int(parts[3])
+    C = int(parts[4]) if len(parts) > 4 else None
+    return A, B, C
+
+def _ids_from_pool(pool):
+    return [x[0] for x in pool]
+
+def generate_offspring_from_elites(rxn_id: int, n: int, elite_names: list[str],
+                                   molecules_A, molecules_B, molecules_C, is_three_component: bool,
+                                   mutation_prob: float = 0.1, seed: int | None = None,
+                                   avoid_names: set[str] = None,
+                                   avoid_inchikeys: set[str] = None,
+                                   max_tries: int = 10) -> list[str]:
+    if seed is not None:
+        random.seed(seed)
+    elite_As, elite_Bs, elite_Cs = set(), set(), set()
+    for name in elite_names:
+        A, B, C = _parse_components(name)
+        if A is not None: elite_As.add(A)
+        if B is not None: elite_Bs.add(B)
+        if C is not None and is_three_component: elite_Cs.add(C)
+
+    pool_A_ids = _ids_from_pool(molecules_A)
+    pool_B_ids = _ids_from_pool(molecules_B)
+    pool_C_ids = _ids_from_pool(molecules_C) if is_three_component else []
+
+    out = []
+    local_names = set()
+    for _ in range(n):
+        cand = None
+        for _try in range(max_tries):
+            use_mutA = (not elite_As) or (random.random() < mutation_prob)
+            use_mutB = (not elite_Bs) or (random.random() < mutation_prob)
+            use_mutC = (not elite_Cs) or (random.random() < mutation_prob)
+
+            A = random.choice(pool_A_ids) if use_mutA else random.choice(list(elite_As))
+            B = random.choice(pool_B_ids) if use_mutB else random.choice(list(elite_Bs))
+            if is_three_component:
+                C = random.choice(pool_C_ids) if use_mutC else random.choice(list(elite_Cs))
+                name = f"rxn:{rxn_id}:{A}:{B}:{C}"
+            else:
+                name = f"rxn:{rxn_id}:{A}:{B}"
+
+            if avoid_names and name in avoid_names:
+                continue
+            if name in local_names:
+                continue
+
+            if avoid_inchikeys:
+                try:
+                    s = get_smiles_from_reaction(name)
+                    if s:
+                        mol = Chem.MolFromSmiles(s)
+                        if mol:
+                            key = Chem.MolToInchiKey(mol)
+                            if key in avoid_inchikeys:
+                                continue
+                except Exception:
+                    pass
+
+            cand = name
+            break
+
+        if cand is None:
+            cand = name
+        out.append(cand)
+        local_names.add(cand)
+        if avoid_names is not None:
+            avoid_names.add(cand)
+    return out
 
 def run_sampler(n_samples: int = 1000, 
                 seed: int = None, 
                 subnet_config: dict = None, 
                 output_path: str = None, 
                 save_to_file: bool = False,
-                db_path: str = None):
-    # QTTECH begin
-    # reactions = get_available_reactions(db_path)
-    # if not reactions:
-    #     bt.logging.error("No reactions found in the database, check db path and integrity.")
-    #     return
-    #
-    # rxn_ids = [reactions[i][0] for i in range(len(reactions))]
-    # QTTECH end
+                db_path: str = None,
+                elite_names: list[str] = None,
+                elite_frac: float = 0.5,
+                mutation_prob: float = 0.1,
+                avoid_inchikeys: set[str] = None):
+    reactions = get_available_reactions(db_path)
+    if not reactions:
+        bt.logging.error("No reactions found in the database, check db path and integrity.")
+        return
+
+    rxn_ids = [reactions[i][0] for i in range(len(reactions))]
 
     rxn_id = int(subnet_config["allowed_reaction"].split(":")[-1])
     bt.logging.info(f"Generating {n_samples} random molecules for reaction {rxn_id}")
-    print(f"Generating {n_samples} random molecules for reaction {rxn_id}")
 
-    # QTTECH begin
-    if rxn_id == 0:
-        gen_type = 'savi'
-    else:
-        gen_type = f"rxn:{rxn_id}"
-
-    molecules: List = FIXED_MOLECULES[gen_type]
-    sampler_data = {"molecules": molecules}
-    # QTTECH end
-
-    # QTTECH begin
     # Generate molecules with validation in batches for efficiency
-    # sampler_data = generate_valid_random_molecules_batch(
-    #     rxn_id, n_samples, db_path, subnet_config, batch_size=200, seed=seed
-    #     )
-    # QTTECH end
+    sampler_data = generate_valid_random_molecules_batch(
+        rxn_id, n_samples, db_path, subnet_config, batch_size=200, seed=seed,
+        elite_names=elite_names, elite_frac=elite_frac, mutation_prob=mutation_prob,
+        avoid_inchikeys=avoid_inchikeys
+        )
 
     if save_to_file:
         with open(output_path, "w") as f:
